@@ -2,7 +2,7 @@ const express = require('express');
 const {
   Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
   HeadingLevel, BorderStyle, WidthType, ShadingType, LevelFormat,
-  AlignmentType, PageBreak, Header, Footer, PageNumber,
+  AlignmentType, PageNumber, Header, Footer,
   TabStopType, TabStopPosition
 } = require('docx');
 const fs = require('fs');
@@ -10,86 +10,151 @@ const fs = require('fs');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// ── Color Palette ──────────────────────────────────────────────────
-const NAVY     = "1A2B4A";
-const GOLD     = "C8922A";
-const BLUE     = "2E5090";
-const BODY     = "333333";
-const LGRAY    = "888888";
-const ALTROW   = "F0F4FA";
-const WHITE    = "FFFFFF";
+// ── Palette ────────────────────────────────────────────────────────
+const C = {
+  navy:    "1A2B4A",
+  gold:    "C8922A",
+  blue:    "2E5090",
+  body:    "222222",
+  lgray:   "888888",
+  mgray:   "555555",
+  altrow:  "F2F5FB",
+  white:   "FFFFFF",
+  p0bg:    "FDF0EF",  p0txt: "B02A20",
+  p1bg:    "FEF6EC",  p1txt: "B05C10",
+  p2bg:    "EEF8EE",  p2txt: "1A6B1A",
+  veribg:  "EAF5EE",  veritxt: "145C2E",
+  calcbg:  "E8EFF8",  calctxt: "1A4A88",
+  assmbg:  "FDF6E3",  asmtxt:  "7A5900",
+  needbg:  "FDF1EE",  neetxt:  "8A2A1A",
+};
 
-// ── Priority & Status Colors ───────────────────────────────────────
-function priorityColor(val) {
-  const v = String(val).trim();
-  if (v === "P0") return "C0392B";
-  if (v === "P1") return "E67E22";
-  if (v === "P2") return "27AE60";
+// Content width: 12240 - 1080 - 1080 = 10080 DXA (0.75" margins each side)
+const PAGE_W    = 12240;
+const MARGIN    = 1080;
+const CONTENT_W = PAGE_W - MARGIN * 2; // 10080
+
+// ── URL truncator ─────────────────────────────────────────────────
+function truncateUrl(text) {
+  const s = String(text ?? "");
+  // If it looks like a full URL, shorten to path only, max 40 chars
+  if (s.startsWith("http://") || s.startsWith("https://")) {
+    try {
+      const u = new URL(s);
+      const path = u.pathname.length > 40
+        ? "…" + u.pathname.slice(-38)
+        : u.pathname || "/";
+      return u.hostname.replace("www.", "") + path;
+    } catch (_) { /* fall through */ }
+  }
+  return s;
+}
+
+// ── Priority / Status cell styling ────────────────────────────────
+function cellStyle(text) {
+  const v = String(text ?? "").trim();
+  if (v === "P0") return { bg: C.p0bg, txt: C.p0txt, bold: true };
+  if (v === "P1") return { bg: C.p1bg, txt: C.p1txt, bold: true };
+  if (v === "P2") return { bg: C.p2bg, txt: C.p2txt, bold: true };
+  if (v.includes("Verified Data"))        return { bg: C.veribg, txt: C.veritxt, bold: false };
+  if (v.includes("Calculated Estimate"))  return { bg: C.calcbg, txt: C.calctxt, bold: false };
+  if (v.includes("Strategic Assumption")) return { bg: C.assmbg, txt: C.asmtxt,  bold: false };
+  if (v.includes("Needs Verification"))   return { bg: C.needbg, txt: C.neetxt,  bold: false };
   return null;
 }
 
-function statusColor(val) {
-  const v = String(val);
-  if (v.includes("Verified Data"))        return "1A7A3A";
-  if (v.includes("Calculated Estimate"))  return "1A5EA0";
-  if (v.includes("Strategic Assumption")) return "8B6914";
-  if (v.includes("Needs Verification"))   return "A03020";
-  return null;
+// ── Smart column width distribution ───────────────────────────────
+// Assigns widths based on column count and typical content.
+// First col gets more space (labels), remaining split proportionally.
+function getColWidths(colCount) {
+  if (colCount === 1) return [CONTENT_W];
+
+  // Weight hints: col 0 is always a label/name col, gets more room.
+  // For very wide tables (7+ cols) compress everything evenly.
+  const total = CONTENT_W;
+
+  if (colCount === 2) {
+    return [Math.round(total * 0.38), Math.round(total * 0.62)];
+  }
+  if (colCount === 3) {
+    const a = Math.round(total * 0.28);
+    const b = Math.round(total * 0.30);
+    const c = total - a - b;
+    return [a, b, c];
+  }
+  if (colCount === 4) {
+    const a = Math.round(total * 0.25);
+    const rest = total - a;
+    const each = Math.round(rest / 3);
+    return [a, each, each, total - a - each * 2];
+  }
+  if (colCount === 5) {
+    const a = Math.round(total * 0.22);
+    const rest = total - a;
+    const each = Math.round(rest / 4);
+    return [a, each, each, each, total - a - each * 3];
+  }
+  if (colCount === 6) {
+    const a = Math.round(total * 0.20);
+    const rest = total - a;
+    const each = Math.round(rest / 5);
+    return [a, each, each, each, each, total - a - each * 4];
+  }
+  // 7+ cols: equal distribution, slight boost for first col
+  const a = Math.round(total * 0.17);
+  const rest = total - a;
+  const each = Math.round(rest / (colCount - 1));
+  const widths = [a];
+  for (let i = 1; i < colCount - 1; i++) widths.push(each);
+  widths.push(total - a - each * (colCount - 2));
+  return widths;
 }
 
-// ── Table Builder ──────────────────────────────────────────────────
-function makeCell(text, isHeader, width, rowIdx) {
-  const stdBorder  = { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" };
-  const goldBorder = { style: BorderStyle.SINGLE, size: 3, color: GOLD };
+// ── Table cell builder ─────────────────────────────────────────────
+function makeCell(rawText, isHeader, width, rowIdx) {
+  const border = { style: BorderStyle.SINGLE, size: 1, color: "D0D8E8" };
+  const topBorder = isHeader
+    ? { style: BorderStyle.SINGLE, size: 4, color: C.gold }
+    : border;
+  const botBorder = isHeader
+    ? { style: BorderStyle.SINGLE, size: 4, color: C.gold }
+    : border;
 
-  const textStr = String(text ?? "");
-  const pc = !isHeader ? priorityColor(textStr) : null;
-  const sc = !isHeader ? statusColor(textStr) : null;
-  const textColor = isHeader ? WHITE : (pc || sc || BODY);
-  const isBold = isHeader || !!pc;
+  const text = truncateUrl(rawText);
+  const style = !isHeader ? cellStyle(text) : null;
 
-  const fill = isHeader ? NAVY : (rowIdx % 2 === 1 ? ALTROW : WHITE);
+  const txtColor = isHeader ? C.white : (style ? style.txt : C.body);
+  const isBold   = isHeader || (style ? style.bold : false);
+  const bgFill   = isHeader
+    ? C.navy
+    : (style ? style.bg : (rowIdx % 2 === 1 ? C.altrow : C.white));
 
   return new TableCell({
-    borders: {
-      top:    isHeader ? goldBorder : stdBorder,
-      bottom: isHeader ? goldBorder : stdBorder,
-      left:   stdBorder,
-      right:  stdBorder
-    },
+    borders: { top: topBorder, bottom: botBorder, left: border, right: border },
     width: { size: width, type: WidthType.DXA },
-    shading: { fill, type: ShadingType.CLEAR },
-    margins: { top: 100, bottom: 100, left: 140, right: 140 },
+    shading: { fill: bgFill, type: ShadingType.CLEAR },
+    margins: { top: 90, bottom: 90, left: 120, right: 120 },
+    verticalAlign: "center",
     children: [new Paragraph({
       alignment: isHeader ? AlignmentType.CENTER : AlignmentType.LEFT,
+      spacing: { before: 0, after: 0 },
       children: [new TextRun({
-        text: textStr,
+        text,
         font: "Arial",
-        size: 18,
+        size: 17,       // 8.5pt — readable without ballooning row height
         bold: isBold,
-        color: textColor
+        color: txtColor
       })]
     })]
   });
 }
 
+// ── Table builder ─────────────────────────────────────────────────
 function buildTable(headers, rows) {
-  const TABLE_W  = 9720;
-  const colCount = headers.length;
-
-  let colWidths;
-  if (colCount === 1) {
-    colWidths = [TABLE_W];
-  } else {
-    const firstColW = Math.floor(TABLE_W * 0.22);
-    const otherColW = Math.floor((TABLE_W - firstColW) / (colCount - 1));
-    colWidths = [firstColW, ...Array(colCount - 1).fill(otherColW)];
-    const diff = TABLE_W - colWidths.reduce((a, b) => a + b, 0);
-    colWidths[colWidths.length - 1] += diff;
-  }
+  const colWidths = getColWidths(headers.length);
 
   return new Table({
-    width: { size: TABLE_W, type: WidthType.DXA },
+    width: { size: CONTENT_W, type: WidthType.DXA },
     columnWidths: colWidths,
     rows: [
       new TableRow({
@@ -103,123 +168,93 @@ function buildTable(headers, rows) {
   });
 }
 
-// ── Cover Page Section ─────────────────────────────────────────────
+// ── Callout table (single-row highlight box) ──────────────────────
+// Used for type:"callout" — visually distinct bordered box
+function buildCallout(headers, row) {
+  const colWidths = getColWidths(headers.length);
+  const goldBorder = { style: BorderStyle.SINGLE, size: 6, color: C.gold };
+  return new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: colWidths,
+    rows: [
+      new TableRow({
+        children: headers.map((h, i) => new TableCell({
+          borders: { top: goldBorder, bottom: { style: BorderStyle.SINGLE, size: 1, color: "D0D8E8" }, left: goldBorder, right: goldBorder },
+          width: { size: colWidths[i], type: WidthType.DXA },
+          shading: { fill: "F0F4FA", type: ShadingType.CLEAR },
+          margins: { top: 80, bottom: 60, left: 120, right: 120 },
+          children: [new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({ text: String(h), font: "Arial", size: 16, bold: false, color: C.mgray })]
+          })]
+        }))
+      }),
+      new TableRow({
+        children: row.map((v, i) => new TableCell({
+          borders: { top: { style: BorderStyle.SINGLE, size: 1, color: "D0D8E8" }, bottom: goldBorder, left: goldBorder, right: goldBorder },
+          width: { size: colWidths[i], type: WidthType.DXA },
+          shading: { fill: C.white, type: ShadingType.CLEAR },
+          margins: { top: 120, bottom: 120, left: 120, right: 120 },
+          children: [new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 0, after: 0 },
+            children: [new TextRun({ text: String(v ?? ""), font: "Arial", size: 22, bold: true, color: C.navy })]
+          })]
+        }))
+      })
+    ]
+  });
+}
+
+// ── Spacer paragraph ──────────────────────────────────────────────
+function spacer(before = 0, after = 120) {
+  return new Paragraph({
+    spacing: { before, after },
+    children: [new TextRun({ text: "", font: "Arial", size: 2 })]
+  });
+}
+
+// ── Cover section ─────────────────────────────────────────────────
 function buildCoverSection(report) {
-  // Extract period from title e.g. "... – 2026-04-08 to 2026-05-08"
   const periodMatch = report.title.match(/(\d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2})/);
   const period = periodMatch ? periodMatch[1] : "";
-  // Extract client name — text between first and second "–"
   const parts = report.title.split("–").map(s => s.trim());
   const clientName = parts.length >= 2 ? parts[1] : report.title;
+
+  const rule = (color, size, before, after) => new Paragraph({
+    border: { bottom: { style: BorderStyle.SINGLE, size, color, space: 1 } },
+    spacing: { before, after },
+    children: [new TextRun({ text: "", font: "Arial", size: 2 })]
+  });
+
+  const centered = (text, size, color, bold, before, after) => new Paragraph({
+    alignment: AlignmentType.CENTER,
+    spacing: { before, after },
+    children: [new TextRun({ text, font: "Arial", size, color, bold: !!bold })]
+  });
 
   return {
     properties: {
       page: {
-        size: { width: 12240, height: 15840 },
+        size: { width: PAGE_W, height: 15840 },
         margin: { top: 2520, bottom: 2520, left: 1800, right: 1800 }
       }
     },
     children: [
-      // Confidential label
+      centered("CONFIDENTIAL  —  FOR INTERNAL USE ONLY", 16, C.gold, true, 0, 320),
+      rule(C.gold, 24, 0, 480),
+      centered("SEO  /  GEO  /  AEO  STRATEGIC REPORT", 20, C.lgray, false, 0, 200),
+      centered(clientName, 52, C.navy, true, 0, 160),
+      centered(report.title, 18, C.lgray, false, 0, 440),
+      rule(C.gold, 24, 0, 560),
+      centered("REPORTING PERIOD", 17, C.lgray, false, 0, 100),
+      centered(period, 28, C.navy, true, 0, 560),
+      centered("Prepared by", 17, C.lgray, false, 0, 80),
+      centered("Digital Growth Strategy Team", 22, C.gold, true, 0, 0),
+      spacer(640, 0),
       new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 360 },
-        children: [new TextRun({
-          text: "CONFIDENTIAL  —  FOR INTERNAL USE ONLY",
-          font: "Arial", size: 16, color: GOLD, bold: true
-        })]
-      }),
-
-      // Gold rule
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        border: { bottom: { style: BorderStyle.SINGLE, size: 24, color: GOLD, space: 1 } },
-        spacing: { before: 0, after: 560 },
-        children: [new TextRun({ text: "", font: "Arial", size: 2 })]
-      }),
-
-      // Report type
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 240 },
-        children: [new TextRun({
-          text: "SEO  /  GEO  /  AEO  STRATEGIC REPORT",
-          font: "Arial", size: 22, color: LGRAY
-        })]
-      }),
-
-      // Client name (big gold)
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 200 },
-        children: [new TextRun({
-          text: clientName,
-          font: "Arial", size: 56, bold: true, color: NAVY
-        })]
-      }),
-
-      // Full title line (smaller navy)
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 480 },
-        children: [new TextRun({
-          text: report.title,
-          font: "Arial", size: 20, color: LGRAY
-        })]
-      }),
-
-      // Gold rule below title
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        border: { bottom: { style: BorderStyle.SINGLE, size: 24, color: GOLD, space: 1 } },
-        spacing: { before: 0, after: 640 },
-        children: [new TextRun({ text: "", font: "Arial", size: 2 })]
-      }),
-
-      // Reporting Period label
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 120 },
-        children: [new TextRun({
-          text: "REPORTING PERIOD",
-          font: "Arial", size: 18, color: LGRAY, bold: false
-        })]
-      }),
-
-      // Period value
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 640 },
-        children: [new TextRun({
-          text: period,
-          font: "Arial", size: 30, color: NAVY, bold: true
-        })]
-      }),
-
-      // Prepared by label
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 100 },
-        children: [new TextRun({
-          text: "Prepared by",
-          font: "Arial", size: 18, color: LGRAY
-        })]
-      }),
-
-      // Team name
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 0, after: 800 },
-        children: [new TextRun({
-          text: "Digital Growth Strategy Team",
-          font: "Arial", size: 24, color: GOLD, bold: true
-        })]
-      }),
-
-      // Bottom thin gold rule
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        border: { top: { style: BorderStyle.SINGLE, size: 6, color: GOLD, space: 1 } },
+        border: { top: { style: BorderStyle.SINGLE, size: 6, color: C.gold, space: 1 } },
         spacing: { before: 0, after: 0 },
         children: [new TextRun({ text: "", font: "Arial", size: 2 })]
       })
@@ -227,57 +262,108 @@ function buildCoverSection(report) {
   };
 }
 
-// ── Main buildDocx ─────────────────────────────────────────────────
+// ── Header / Footer ───────────────────────────────────────────────
+function buildHeader(clientName) {
+  return new Header({
+    children: [
+      new Paragraph({
+        border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: C.gold, space: 4 } },
+        spacing: { before: 0, after: 100 },
+        tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
+        children: [
+          new TextRun({ text: clientName, font: "Arial", size: 17, bold: true, color: C.navy }),
+          new TextRun({ text: "\t", font: "Arial", size: 17 }),
+          new TextRun({ text: "SEO / GEO / AEO Strategic Report", font: "Arial", size: 17, color: C.lgray })
+        ]
+      })
+    ]
+  });
+}
+
+function buildFooter() {
+  return new Footer({
+    children: [
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        border: { top: { style: BorderStyle.SINGLE, size: 4, color: "DDDDDD", space: 4 } },
+        spacing: { before: 80, after: 0 },
+        children: [
+          new TextRun({ text: "Page ", font: "Arial", size: 17, color: C.lgray }),
+          new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 17, color: C.lgray }),
+          new TextRun({ text: " of ", font: "Arial", size: 17, color: C.lgray }),
+          new TextRun({ children: [PageNumber.TOTAL_PAGES], font: "Arial", size: 17, color: C.lgray })
+        ]
+      })
+    ]
+  });
+}
+
+// ── Section heading (H1) ──────────────────────────────────────────
+// Always page-breaks before (cover is already a separate section,
+// so the very first body H1 still gets its own page)
+function buildH1(text) {
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_1,
+    pageBreakBefore: true,
+    children: [new TextRun({ text, font: "Arial" })]
+  });
+}
+
+// ── Subheading (H2) ───────────────────────────────────────────────
+function buildH2(text) {
+  return new Paragraph({
+    heading: HeadingLevel.HEADING_2,
+    children: [new TextRun({ text, font: "Arial" })]
+  });
+}
+
+// ── Main document builder ─────────────────────────────────────────
 async function buildDocx(report) {
+  // Derive client name for dynamic header
+  const titleParts = report.title.split("–").map(s => s.trim());
+  const clientName = titleParts.length >= 2 ? titleParts[1] : "Client";
+
+  // Filter out any COVER PAGE section from JSON (formatter handles cover)
+  const contentSections = report.sections.filter(
+    s => !s.heading.toUpperCase().includes("COVER")
+  );
+
   const coverSection = buildCoverSection(report);
-
   const bodyChildren = [];
-  let isFirstSection = true;
 
-  for (const section of report.sections) {
-    // H1 — with page break on all except first
-    bodyChildren.push(new Paragraph({
-      heading: HeadingLevel.HEADING_1,
-      pageBreakBefore: !isFirstSection,
-      children: [new TextRun({ text: section.heading, font: "Arial" })]
-    }));
-    isFirstSection = false;
+  for (const section of contentSections) {
+    // H1 — always page breaks before
+    bodyChildren.push(buildH1(section.heading));
 
     for (const sub of section.subsections) {
-      // Subtle divider before each H2
-      bodyChildren.push(new Paragraph({
-        spacing: { before: 160, after: 160 },
-        border: { bottom: { style: BorderStyle.SINGLE, size: 1, color: "E0E4EC", space: 1 } },
-        children: [new TextRun({ text: "", size: 2 })]
-      }));
-
-      // H2
-      bodyChildren.push(new Paragraph({
-        heading: HeadingLevel.HEADING_2,
-        children: [new TextRun({ text: sub.subheading, font: "Arial" })]
-      }));
+      bodyChildren.push(buildH2(sub.subheading));
 
       if (sub.type === "paragraph") {
         bodyChildren.push(new Paragraph({
-          spacing: { before: 60, after: 100, line: 276, lineRule: "auto" },
-          children: [new TextRun({ text: sub.content, font: "Arial", size: 20, color: BODY })]
+          spacing: { before: 40, after: 140, line: 288, lineRule: "auto" },
+          children: [new TextRun({ text: sub.content, font: "Arial", size: 20, color: C.body })]
         }));
 
       } else if (sub.type === "bullets") {
         for (const item of sub.items) {
           bodyChildren.push(new Paragraph({
             numbering: { reference: "bullets", level: 0 },
-            spacing: { before: 60, after: 60 },
-            children: [new TextRun({ text: item, font: "Arial", size: 20, color: BODY })]
+            spacing: { before: 40, after: 60 },
+            children: [new TextRun({ text: String(item), font: "Arial", size: 19, color: C.body })]
           }));
         }
+        bodyChildren.push(spacer(0, 80));
 
       } else if (sub.type === "table") {
+        bodyChildren.push(spacer(40, 60));
         bodyChildren.push(buildTable(sub.headers, sub.rows));
-        bodyChildren.push(new Paragraph({
-          spacing: { before: 0, after: 200 },
-          children: [new TextRun({ text: "", font: "Arial", size: 4 })]
-        }));
+        bodyChildren.push(spacer(0, 160));
+
+      } else if (sub.type === "callout") {
+        // Single-row highlight box for commercial estimates etc.
+        bodyChildren.push(spacer(40, 60));
+        bodyChildren.push(buildCallout(sub.headers, sub.row));
+        bodyChildren.push(spacer(0, 160));
       }
     }
   }
@@ -285,43 +371,12 @@ async function buildDocx(report) {
   const bodySection = {
     properties: {
       page: {
-        size: { width: 12240, height: 15840 },
-        margin: { top: 1080, bottom: 1080, left: 1260, right: 1260 }
+        size: { width: PAGE_W, height: 15840 },
+        margin: { top: 1080, bottom: 1080, left: MARGIN, right: MARGIN }
       }
     },
-    headers: {
-      default: new Header({
-        children: [
-          new Paragraph({
-            border: { bottom: { style: BorderStyle.SINGLE, size: 6, color: GOLD, space: 4 } },
-            spacing: { before: 0, after: 120 },
-            tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
-            children: [
-              new TextRun({ text: "Crunchy Fashion", font: "Arial", size: 18, bold: true, color: NAVY }),
-              new TextRun({ text: "\t", font: "Arial", size: 18 }),
-              new TextRun({ text: "SEO / GEO / AEO Strategic Report", font: "Arial", size: 18, color: LGRAY })
-            ]
-          })
-        ]
-      })
-    },
-    footers: {
-      default: new Footer({
-        children: [
-          new Paragraph({
-            alignment: AlignmentType.CENTER,
-            border: { top: { style: BorderStyle.SINGLE, size: 4, color: "DDDDDD", space: 4 } },
-            spacing: { before: 80, after: 0 },
-            children: [
-              new TextRun({ text: "Page ", font: "Arial", size: 18, color: LGRAY }),
-              new TextRun({ children: [PageNumber.CURRENT], font: "Arial", size: 18, color: LGRAY }),
-              new TextRun({ text: " of ", font: "Arial", size: 18, color: LGRAY }),
-              new TextRun({ children: [PageNumber.TOTAL_PAGES], font: "Arial", size: 18, color: LGRAY })
-            ]
-          })
-        ]
-      })
-    },
+    headers: { default: buildHeader(clientName) },
+    footers: { default: buildFooter() },
     children: bodyChildren
   };
 
@@ -336,20 +391,8 @@ async function buildDocx(report) {
             text: "\u25A0",
             alignment: AlignmentType.LEFT,
             style: {
-              run: { color: GOLD, size: 16, font: "Arial" },
-              paragraph: { indent: { left: 720, hanging: 360 } }
-            }
-          }]
-        },
-        {
-          reference: "numbers",
-          levels: [{
-            level: 0,
-            format: LevelFormat.DECIMAL,
-            text: "%1.",
-            alignment: AlignmentType.LEFT,
-            style: {
-              paragraph: { indent: { left: 720, hanging: 360 } }
+              run: { color: C.gold, size: 16, font: "Arial" },
+              paragraph: { indent: { left: 560, hanging: 320 } }
             }
           }]
         }
@@ -357,30 +400,30 @@ async function buildDocx(report) {
     },
     styles: {
       default: {
-        document: { run: { font: "Arial", size: 20, color: BODY } }
+        document: { run: { font: "Arial", size: 20, color: C.body } }
       },
       paragraphStyles: [
         {
           id: "Heading1", name: "Heading 1",
           basedOn: "Normal", next: "Normal", quickFormat: true,
-          run: { size: 32, bold: true, color: NAVY, font: "Arial" },
+          run: { size: 30, bold: true, color: C.navy, font: "Arial" },
           paragraph: {
-            spacing: { before: 480, after: 200 },
+            spacing: { before: 0, after: 180 },  // no top space — page break handles it
             outlineLevel: 0,
             border: {
-              left:   { style: BorderStyle.SINGLE, size: 20, color: GOLD, space: 8 },
-              bottom: { style: BorderStyle.SINGLE, size: 6,  color: GOLD, space: 4 }
+              left:   { style: BorderStyle.SINGLE, size: 18, color: C.gold, space: 8 },
+              bottom: { style: BorderStyle.SINGLE, size: 4,  color: C.gold, space: 4 }
             }
           }
         },
         {
           id: "Heading2", name: "Heading 2",
           basedOn: "Normal", next: "Normal", quickFormat: true,
-          run: { size: 24, bold: true, color: BLUE, font: "Arial" },
+          run: { size: 22, bold: true, color: C.blue, font: "Arial" },
           paragraph: {
-            spacing: { before: 280, after: 120 },
+            spacing: { before: 220, after: 80 },  // tight — content follows closely
             outlineLevel: 1,
-            indent: { left: 160 }
+            indent: { left: 120 }
           }
         }
       ]
@@ -399,6 +442,7 @@ app.post('/generate', async (req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename="report.docx"');
     res.send(buffer);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -414,6 +458,7 @@ app.post('/generate-link', async (req, res) => {
       message: "Report generated successfully"
     });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
