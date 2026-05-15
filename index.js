@@ -128,6 +128,9 @@ app.post('/generate', async (req, res) => {
   }
 });
 
+
+
+app.get('/health', (req, res) => res.send('OK'));
 app.post('/generate-link', async (req, res) => {
   try {
     // ... same docx generation code ...
@@ -156,6 +159,4 @@ app.get('/download/:filename', (req, res) => {
     res.status(404).json({ error: 'File not found' });
   }
 });
-
-app.get('/health', (req, res) => res.send('OK'));
 app.listen(process.env.PORT || 3000, () => console.log('Formatter running'));
