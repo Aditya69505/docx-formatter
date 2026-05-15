@@ -128,5 +128,34 @@ app.post('/generate', async (req, res) => {
   }
 });
 
+app.post('/generate-link', async (req, res) => {
+  try {
+    // ... same docx generation code ...
+    const buffer = await Packer.toBuffer(doc);
+    const filename = `report_${Date.now()}.docx`;
+    const filepath = `/tmp/${filename}`;
+    fs.writeFileSync(filepath, buffer);
+    
+    // Return the download URL
+    res.json({ 
+      download_url: `https://docx-formatter-iobk.onrender.com/download/${filename}`,
+      message: "Report generated successfully"
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/download/:filename', (req, res) => {
+  const filepath = `/tmp/${req.params.filename}`;
+  if (fs.existsSync(filepath)) {
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename="SEO_Report.docx"`);
+    res.send(fs.readFileSync(filepath));
+  } else {
+    res.status(404).json({ error: 'File not found' });
+  }
+});
+
 app.get('/health', (req, res) => res.send('OK'));
 app.listen(process.env.PORT || 3000, () => console.log('Formatter running'));
